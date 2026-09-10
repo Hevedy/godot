@@ -199,7 +199,7 @@ class LightmapperRD : public Lightmapper {
 		float min_bounds[3] = {};
 		uint32_t cull_mode = 0;
 		float max_bounds[3] = {};
-		float pad1 = 0.0;
+		uint32_t flags = 0;
 		bool operator<(const Triangle &p_triangle) const {
 			return slice < p_triangle.slice;
 		}
@@ -213,6 +213,11 @@ class LightmapperRD : public Lightmapper {
 	};
 
 	Vector<MeshInstance> mesh_instances;
+	Vector<int> receiver_mesh_indices;
+	int receiver_atlas_slices = 0;
+	bool has_non_receivers = false;
+	bool has_custom_shadow_casting = false;
+	bool has_custom_indirect_contribution = false;
 
 	Vector<Light> lights;
 	Vector<LightMetadata> light_metadata;
