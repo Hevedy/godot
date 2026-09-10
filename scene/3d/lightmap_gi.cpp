@@ -399,15 +399,19 @@ LightmapGIData::~LightmapGIData() {
 void LightmapGI::_find_meshes_and_lights(Node *p_at_node, Vector<MeshesFound> &meshes, Vector<LightsFound> &lights, Vector<Vector3> &probes) {
 	MeshInstance3D *mi = Object::cast_to<MeshInstance3D>(p_at_node);
 	if (mi && mi->get_gi_mode() == GeometryInstance3D::GI_MODE_STATIC && mi->is_visible_in_tree()) {
-		Ref<Mesh> mesh = mi->get_mesh();
+		const GeometryInstance3D::ShadowCastingSetting shadow_mode = mi->get_cast_shadows_setting();
+		const bool cast_shadow = shadow_mode != GeometryInstance3D::SHADOW_CASTING_SETTING_OFF;
+		const bool participates = mi->is_lightmap_receive_enabled() || mi->is_lightmap_contribute_enabled() || mi->is_lightmap_emissive_enabled() || cast_shadow;
+		Ref<Mesh> mesh = participates ? mi->get_mesh() : Ref<Mesh>();
 		if (mesh.is_valid()) {
 			bool all_have_uv2_and_normal = true;
 			bool surfaces_found = false;
+			const bool needs_uv2 = mi->is_lightmap_receive_enabled() || mi->is_lightmap_contribute_enabled() || mi->is_lightmap_emissive_enabled();
 			for (int i = 0; i < mesh->get_surface_count(); i++) {
 				if (mesh->surface_get_primitive_type(i) != Mesh::PRIMITIVE_TRIANGLES) {
 					continue;
 				}
-				if (!(mesh->surface_get_format(i) & Mesh::ARRAY_FORMAT_TEX_UV2)) {
+				if (needs_uv2 && !(mesh->surface_get_format(i) & Mesh::ARRAY_FORMAT_TEX_UV2)) {
 					all_have_uv2_and_normal = false;
 					break;
 				}
@@ -426,6 +430,13 @@ void LightmapGI::_find_meshes_and_lights(Node *p_at_node, Vector<MeshesFound> &m
 				mf.node_path = get_path_to(mi);
 				mf.subindex = -1;
 				mf.mesh = mesh;
+				mf.receive = mi->is_lightmap_receive_enabled();
+				mf.contribute = mi->is_lightmap_contribute_enabled();
+				mf.emissive = mi->is_lightmap_emissive_enabled();
+				mf.cast_shadow = cast_shadow;
+				mf.cast_shadow_double_sided =
+						shadow_mode == GeometryInstance3D::SHADOW_CASTING_SETTING_DOUBLE_SIDED ||
+						shadow_mode == GeometryInstance3D::SHADOW_CASTING_SETTING_SHADOWS_ONLY_DOUBLE_SIDED;
 				mf.lightmap_scale = mi->get_lightmap_texel_scale();
 
 				Ref<Material> all_override = mi->get_material_override();
@@ -1104,14 +1115,14 @@ LightmapGI::BakeError LightmapGI::bake(Node *p_from_node, String p_image_data_pa
 
 			MeshesFound &mf = meshes_found.write[m_i];
 
+			const bool needs_uv2 = mf.receive || mf.contribute || mf.emissive;
 			Size2i mesh_lightmap_size = mf.mesh->get_lightmap_size_hint();
 			if (mesh_lightmap_size == Size2i(0, 0)) {
-				// TODO we should compute a size if no lightmap hint is set, as we did in 3.x.
-				// For now set to basic size to avoid crash.
-				mesh_lightmap_size = Size2i(64, 64);
+				// Shadow-only geometry needs no useful UV-space resolution.
+				mesh_lightmap_size = needs_uv2 ? Size2i(64, 64) : Size2i(1, 1);
 			}
 			// Double lightmap texel density if downsampling is enabled, as the final texture size will be halved before saving lightmaps.
-			Size2i lightmap_size = Size2i(Size2(mesh_lightmap_size) * mf.lightmap_scale * texel_scale) * (supersampling_enabled ? supersampling_factor : 1.0);
+			Size2i lightmap_size = needs_uv2 ? Size2i(Size2(mesh_lightmap_size) * mf.lightmap_scale * texel_scale) * (supersampling_enabled ? supersampling_factor : 1.0) : Size2i(1, 1);
 			ERR_FAIL_COND_V(lightmap_size.x == 0 || lightmap_size.y == 0, BAKE_ERROR_LIGHTMAP_TOO_SMALL);
 
 			TypedArray<RID> overrides;
@@ -1121,16 +1132,30 @@ LightmapGI::BakeError LightmapGI::bake(Node *p_from_node, String p_image_data_pa
 					overrides[i] = mf.overrides[i]->get_rid();
 				}
 			}
-			TypedArray<Image> images = RS::get_singleton()->bake_render_uv2(mf.mesh->get_rid(), overrides, lightmap_size);
-
-			ERR_FAIL_COND_V(images.is_empty(), BAKE_ERROR_CANT_CREATE_IMAGE);
-
-			Ref<Image> albedo = images[RSE::BAKE_CHANNEL_ALBEDO_ALPHA];
-			Ref<Image> orm = images[RSE::BAKE_CHANNEL_ORM];
+			TypedArray<Image> images;
+			Ref<Image> albedo;
+			Ref<Image> orm;
+			if (needs_uv2) {
+				images = RS::get_singleton()->bake_render_uv2(mf.mesh->get_rid(), overrides, lightmap_size);
+				ERR_FAIL_COND_V(images.is_empty(), BAKE_ERROR_CANT_CREATE_IMAGE);
+				albedo = images[RSE::BAKE_CHANNEL_ALBEDO_ALPHA];
+				orm = images[RSE::BAKE_CHANNEL_ORM];
+			} else {
+				// UV2-less shadow-only geometry is treated as fully opaque.
+				albedo = Image::create_empty(1, 1, false, Image::FORMAT_RGBA8);
+				albedo->fill(Color(1, 1, 1, 1));
+				orm = Image::create_empty(1, 1, false, Image::FORMAT_RGBA8);
+				orm->fill(Color(1, 1, 0, 1));
+			}
 
 			//multiply albedo by metal
 
 			Lightmapper::MeshData md;
+			md.receive = mf.receive;
+			md.contribute = mf.contribute;
+			md.emissive = mf.emissive;
+			md.cast_shadow = mf.cast_shadow;
+			md.cast_shadow_double_sided = mf.cast_shadow_double_sided;
 
 			{
 				Dictionary d;
@@ -1169,9 +1194,14 @@ LightmapGI::BakeError LightmapGI::bake(Node *p_from_node, String p_image_data_pa
 				md.albedo_on_uv2->set_data(lightmap_size.width, lightmap_size.height, false, Image::FORMAT_RGBA8, albedom);
 			}
 
-			md.emission_on_uv2 = images[RSE::BAKE_CHANNEL_EMISSION];
-			if (md.emission_on_uv2->get_format() != Image::FORMAT_RGBAH) {
-				md.emission_on_uv2->convert(Image::FORMAT_RGBAH);
+			if (mf.emissive) {
+				md.emission_on_uv2 = images[RSE::BAKE_CHANNEL_EMISSION];
+				if (md.emission_on_uv2->get_format() != Image::FORMAT_RGBAH) {
+					md.emission_on_uv2->convert(Image::FORMAT_RGBAH);
+				}
+			} else {
+				md.emission_on_uv2 = Image::create_empty(lightmap_size.width, lightmap_size.height, false, Image::FORMAT_RGBAH);
+				md.emission_on_uv2->set_as_black();
 			}
 
 			//get geometry
@@ -1197,10 +1227,12 @@ LightmapGI::BakeError LightmapGI::bake(Node *p_from_node, String p_image_data_pa
 				const Vector3 *nr = nullptr;
 				Vector<int> index = a[Mesh::ARRAY_INDEX];
 
-				ERR_CONTINUE(uv.is_empty());
+				ERR_CONTINUE(needs_uv2 && uv.is_empty());
 				ERR_CONTINUE(normals.is_empty());
 
-				uvr = uv.ptr();
+				if (!uv.is_empty()) {
+					uvr = uv.ptr();
+				}
 				nr = normals.ptr();
 
 				int facecount;
@@ -1235,7 +1267,7 @@ LightmapGI::BakeError LightmapGI::bake(Node *p_from_node, String p_image_data_pa
 						}
 						md.points.push_back(v);
 
-						md.uv2.push_back(uvr[vidx[k]]);
+						md.uv2.push_back(uvr ? uvr[vidx[k]] : Vector2(0.5f, 0.5f));
 						md.normal.push_back(normal_xform.xform(nr[vidx[k]]).normalized());
 						md.material.push_back(mat_rid);
 					}
