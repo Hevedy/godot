@@ -164,6 +164,11 @@ public:
 		Vector<RID> material;
 		Ref<Image> albedo_on_uv2;
 		Ref<Image> emission_on_uv2;
+		bool receive = true;
+		bool contribute = true;
+		bool emissive = true;
+		bool cast_shadow = true;
+		bool cast_shadow_double_sided = false;
 		Variant userdata;
 	};
 
