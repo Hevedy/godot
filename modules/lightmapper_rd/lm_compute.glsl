@@ -568,6 +568,12 @@ void trace_direct_light(vec3 p_position, vec3 p_normal, uint p_light_index, bool
 		return;
 	}
 
+	if (light_data.shadow_enabled == 0u) {
+		r_shadow = 1.0;
+		r_light = light_data.energy * attenuation * light_data.color.rgb * light_texture_color;
+		return;
+	}
+
 	float penumbra = 0.0;
 	vec3 penumbra_color = vec3(0.0);
 	if (p_soft_shadowing) {
